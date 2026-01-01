@@ -9,6 +9,58 @@ from mathutils import Vector
 from .toolkit_common import ToolkitUtils, ToolkitOperator, ToolkitPanel
 
 
+# ==================== OVERLAY UPDATE OPERATORS ====================
+
+class EMESH_OT_UpdateShapekeyOverlay(ToolkitOperator):
+    """Update shapekey overlay (internal - triggered by scene changes)"""
+    bl_idname = "mesh.emesh_update_shapekey_overlay"
+    bl_label = "Update Overlay"
+    
+    def execute(self, context):
+        # This just forces a redraw by the overlay handler
+        return {"FINISHED"}
+
+
+class EMESH_OT_AutoSelectShapekey(ToolkitOperator):
+    """Automatically select shapekey by name or first available"""
+    bl_idname = "mesh.emesh_auto_select_shapekey"
+    bl_label = "Auto-Select Shapekey"
+    
+    def execute(self, context):
+        props = context.scene.emesh_toolkit
+        obj = ToolkitUtils.get_active_mesh_obj(context)
+        
+        # Don't auto-select if locked
+        if props.lock_shapekey_selection:
+            return {"FINISHED"}
+        
+        if not obj or not obj.data.shape_keys:
+            return {"FINISHED"}
+        
+        current_name = props.shapekey_name
+        key_blocks = obj.data.shape_keys.key_blocks
+        available_names = [kb.name for kb in key_blocks]
+        
+        # Try to find shapekey with same name
+        if current_name in available_names:
+            return {"FINISHED"}
+        
+        # Try to find any non-Basis shapekey with same name
+        for kb in key_blocks:
+            if kb.name == current_name:
+                props.shapekey_name = kb.name
+                return {"FINISHED"}
+        
+        # If not found, select first non-Basis shapekey
+        for kb in key_blocks:
+            if kb.name != "Basis":
+                props.shapekey_name = kb.name
+                bpy.ops.mesh.emesh_scan_shapekey()
+                return {"FINISHED"}
+        
+        return {"FINISHED"}
+
+
 # ==================== OPERATORS ====================
 
 class EMESH_OT_DeleteUselessShapekeys(ToolkitOperator):
@@ -33,8 +85,15 @@ class EMESH_OT_DeleteUselessShapekeys(ToolkitOperator):
     def execute(self, context):
         deleted_count = 0
         
-        for obj in context.selected_objects:
-            if obj.type != "MESH" or not obj.data.shape_keys:
+        # Get selected objects or active object
+        objs = context.selected_objects if context.selected_objects else [ToolkitUtils.get_active_mesh_obj(context)]
+        objs = [o for o in objs if o and o.type == "MESH"]
+        
+        if not objs:
+            return self.report_warning("No mesh objects selected")
+        
+        for obj in objs:
+            if not obj.data.shape_keys:
                 continue
             if not obj.data.shape_keys.use_relative:
                 continue
@@ -50,6 +109,7 @@ class EMESH_OT_DeleteUselessShapekeys(ToolkitOperator):
                     continue
                 
                 kb.data.foreach_get("co", locs)
+                locs_copy = locs.copy()
                 
                 if kb.relative_key.name not in cache:
                     rel_locs = np.empty(3 * nverts, dtype=np.float32)
@@ -57,8 +117,8 @@ class EMESH_OT_DeleteUselessShapekeys(ToolkitOperator):
                     cache[kb.relative_key.name] = rel_locs
                 rel_locs = cache[kb.relative_key.name]
                 
-                locs -= rel_locs
-                if (np.abs(locs) < self.tolerance).all():
+                locs_copy -= rel_locs
+                if (np.abs(locs_copy) < self.tolerance).all():
                     to_delete.append(kb.name)
             
             for kb_name in to_delete:
@@ -104,6 +164,8 @@ class EMESH_OT_ScanShapekey(ToolkitOperator):
                     item.z = co.z
                     item.distance = distance
         
+        # Trigger overlay update for reactive display
+        bpy.ops.mesh.emesh_update_shapekey_overlay()
         return self.report_info(f"Found {len(props.vertex_list)} modified vertices")
 
 
@@ -155,6 +217,8 @@ class EMESH_OT_ShapekeyZeroOut(ToolkitOperator):
                 shapekey.data[vid].co = obj.data.vertices[vid].co.copy()
         
         bpy.ops.mesh.emesh_scan_shapekey()
+        # Trigger overlay update for reactive display
+        bpy.ops.mesh.emesh_update_shapekey_overlay()
         return self.report_info(f"Zeroed out {len(selected)} vertices")
 
 
@@ -193,6 +257,8 @@ class EMESH_OT_ShapekeyApplyValues(ToolkitOperator):
                     shapekey.data[vid].co = value
         
         bpy.ops.mesh.emesh_scan_shapekey()
+        # Trigger overlay update for reactive display
+        bpy.ops.mesh.emesh_update_shapekey_overlay()
         return self.report_info(f"Applied values to {len(selected)} vertices")
 
 
@@ -267,59 +333,87 @@ class EMESH_PT_Shapekeys(ToolkitPanel):
         layout = self.layout
         obj = ToolkitUtils.get_active_mesh_obj(context)
         
-        # Cleanup
-        box = layout.box()
-        box.label(text="Cleanup:", icon="BRUSH_DATA")
-        box.operator("mesh.emesh_delete_useless_shapekeys", icon="TRASH")
+        # ===== CLEANUP SECTION =====
+        cleanup_box = layout.box()
+        cleanup_box.label(text="Cleanup", icon="BRUSH_DATA")
+        cleanup_box.operator("mesh.emesh_delete_useless_shapekeys", icon="TRASH")
         
-        # Vertex Editor
+        # ===== VERTEX EDITOR SECTION =====
         if obj and obj.data.shape_keys:
-            box = layout.box()
-            box.label(text="Vertex Editor:", icon="EDITMODE_HLT")
-            box.prop(props, "overlay_shapekey", icon="OVERLAY")
+            editor_box = layout.box()
+            editor_box.label(text="Vertex Editor", icon="EDITMODE_HLT")
             
-            if props.overlay_shapekey:
-                sbox = box.box()
-                sbox.label(text="Overlay Settings:", icon="SETTINGS")
-                sbox.prop(props, "display_threshold")
-                sbox.prop(props, "limit_display")
-                if props.limit_display:
-                    sbox.prop(props, "max_display_vertices", slider=True)
-            
-            box.prop_search(props, "shapekey_name", obj.data.shape_keys, "key_blocks")
+            # Shapekey selection
+            select_box = editor_box.box()
+            select_box.label(text="Select Shapekey", icon="SHAPEKEY_DATA")
+            select_row = select_box.row(align=True)
+            select_row.prop_search(props, "shapekey_name", obj.data.shape_keys, "key_blocks")
+            select_row.prop(props, "lock_shapekey_selection", text="", icon="LOCKED" if props.lock_shapekey_selection else "UNLOCKED", emboss=True)
             
             if props.shapekey_name:
-                box.operator("mesh.emesh_scan_shapekey", icon="VIEWZOOM")
-                box.operator("mesh.emesh_shapekey_add_from_edit", icon="EDITMODE_HLT")
+                # Overlay settings
+                overlay_box = editor_box.box()
+                overlay_box.label(text="Overlay", icon="OVERLAY")
+                row = overlay_box.row(align=True)
+                row.prop(props, "overlay_shapekey", text="Show", icon="OVERLAY")
                 
+                if props.overlay_shapekey:
+                    settings_box = overlay_box.box()
+                    settings_box.label(text="Settings", icon="PREFERENCES")
+                    settings_box.prop(props, "display_threshold", slider=True)
+                    settings_box.prop(props, "limit_display")
+                    if props.limit_display:
+                        settings_box.prop(props, "max_display_vertices", slider=True)
+                
+                # Scanning
+                scan_box = editor_box.box()
+                scan_box.label(text="Scan & Select", icon="VIEWZOOM")
+                row = scan_box.row(align=True)
+                row.operator("mesh.emesh_scan_shapekey", text="Scan", icon="VIEWZOOM")
+                row.operator("mesh.emesh_shapekey_add_from_edit", text="From Edit", icon="EDITMODE_HLT")
+                
+                # Vertex list
                 if props.vertex_list:
-                    vbox = box.box()
-                    vbox.label(text=f"Modified Vertices: {len(props.vertex_list)}", icon="VERTEXSEL")
-                    vbox.template_list(
+                    list_box = editor_box.box()
+                    list_box.label(text=f"Modified Vertices: {len(props.vertex_list)}", icon="VERTEXSEL")
+                    list_box.template_list(
                         "EMESH_UL_VertexList", "", props, "vertex_list",
-                        props, "vertex_list_index", rows=6
+                        props, "vertex_list_index", rows=5
                     )
                     
+                    # Selection and editing
                     selected_count = len(ToolkitUtils.parse_vertex_indices(props.selected_vertices))
-                    vbox.label(text=f"Selected: {selected_count}", icon="OBJECT_DATA")
                     
                     if selected_count > 0:
-                        ebox = vbox.box()
-                        ebox.label(text="Edit Selected:", icon="TOOL_SETTINGS")
-                        ebox.prop(props, "apply_mode", expand=True)
-                        col = ebox.column(align=True)
-                        col.prop(props, "value_x")
-                        col.prop(props, "value_y")
-                        col.prop(props, "value_z")
-                        row = ebox.row(align=True)
-                        row.operator("mesh.emesh_shapekey_apply_values", icon="CHECKMARK")
-                        row.operator("mesh.emesh_shapekey_zero_out", text="Zero", icon="TRASH")
-                        ebox.operator("mesh.emesh_shapekey_clear_selection", icon="X")
+                        edit_box = list_box.box()
+                        edit_box.label(text=f"Edit {selected_count} Vertex(es)", icon="TOOL_SETTINGS")
+                        
+                        # Mode selection
+                        mode_row = edit_box.row(align=True)
+                        mode_row.prop(props, "apply_mode", expand=True)
+                        
+                        # Values
+                        val_col = edit_box.column(align=True)
+                        val_col.prop(props, "value_x")
+                        val_col.prop(props, "value_y")
+                        val_col.prop(props, "value_z")
+                        
+                        # Action buttons
+                        action_row = edit_box.row(align=True)
+                        action_row.operator("mesh.emesh_shapekey_apply_values", text="Apply", icon="CHECKMARK")
+                        action_row.operator("mesh.emesh_shapekey_zero_out", text="Zero", icon="TRASH")
+                        
+                        # Clear selection
+                        edit_box.operator("mesh.emesh_shapekey_clear_selection", text="Clear Selection", icon="X")
+                    else:
+                        list_box.label(text="Select vertices to edit", icon="INFO")
 
 
 # ==================== REGISTRATION ====================
 
 classes = (
+    EMESH_OT_UpdateShapekeyOverlay,
+    EMESH_OT_AutoSelectShapekey,
     EMESH_OT_DeleteUselessShapekeys,
     EMESH_OT_ScanShapekey,
     EMESH_OT_ShapekeySelectVertex,

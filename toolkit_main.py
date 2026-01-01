@@ -3,13 +3,13 @@ Emil's Mesh Toolkit - Modular Edition
 Main registration file and shared overlay system
 
 Author: Emil
-Version: 2.5 (Modular)
+Version: 2.5.4 (Auto-Selection, Weight Normalization, Reactive Updates)
 """
 
 bl_info = {
     "name": "Emil's Mesh Toolkit",
     "author": "Emil",
-    "version": (2, 5, 0),
+    "version": (2, 5, 4),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > Emil",
     "description": "Collection of tools for shapekeys, weights, rigging, and selection",
@@ -42,6 +42,35 @@ from . import mod_rigging
 from . import mod_selection
 
 
+# ==================== UPDATE CALLBACKS ====================
+
+def update_weight_limit(self, context):
+    """Rescan weights when limit changes"""
+    if hasattr(bpy.ops.mesh, 'emesh_scan_weights'):
+        try:
+            bpy.ops.mesh.emesh_scan_weights()
+        except:
+            pass
+
+
+def update_max_bone_groups(self, context):
+    """Rescan vertex groups when max changes"""
+    if hasattr(bpy.ops.mesh, 'emesh_scan_vertex_groups'):
+        try:
+            bpy.ops.mesh.emesh_scan_vertex_groups()
+        except:
+            pass
+
+
+def update_shapekey_selection(self, context):
+    """Rescan shapekey when selection changes"""
+    if hasattr(bpy.ops.mesh, 'emesh_scan_shapekey'):
+        try:
+            bpy.ops.mesh.emesh_scan_shapekey()
+        except:
+            pass
+
+
 # ==================== PROPERTIES ====================
 
 class EMESH_VertexItem(bpy.types.PropertyGroup):
@@ -64,7 +93,15 @@ class EMESH_ToolkitProperties(bpy.types.PropertyGroup):
     """Main property group for all toolkit settings"""
     
     # Shapekey properties
-    shapekey_name: bpy.props.StringProperty(name="Shapekey")
+    shapekey_name: bpy.props.StringProperty(
+        name="Shapekey",
+        update=update_shapekey_selection
+    )
+    lock_shapekey_selection: bpy.props.BoolProperty(
+        name="Lock Selection",
+        default=False,
+        description="Prevent automatic shapekey selection when changing objects"
+    )
     vertex_list: bpy.props.CollectionProperty(type=EMESH_VertexItem)
     vertex_list_index: bpy.props.IntProperty()
     selected_vertices: bpy.props.StringProperty(default="")
@@ -88,7 +125,7 @@ class EMESH_ToolkitProperties(bpy.types.PropertyGroup):
     )
     max_display_vertices: bpy.props.IntProperty(
         name="Max Vertices",
-        default=2000,
+        default=5000,
         min=10,
         max=50000,
         description="Maximum vertices to display in overlay"
@@ -106,19 +143,34 @@ class EMESH_ToolkitProperties(bpy.types.PropertyGroup):
     value_z: bpy.props.FloatProperty(name="Z", default=0.0, precision=4)
     
     # Weight properties
-    overlay_weights: bpy.props.BoolProperty(
-        name="Show Weight Overlay",
-        default=False,
-        description="Display over-limit vertices"
-    )
     weight_limit: bpy.props.FloatProperty(
         name="Weight Limit",
         default=1.0,
         min=0.0,
         max=5.0,
-        description="Maximum total weight per vertex"
+        description="Maximum total weight per vertex",
+        update=update_weight_limit
+    )
+    overlay_weights: bpy.props.BoolProperty(
+        name="Show Weight Overlay",
+        default=False,
+        description="Display over-limit vertices (red)"
+    )
+    overlay_vertex_groups: bpy.props.BoolProperty(
+        name="Show Vertex Group Overlay",
+        default=False,
+        description="Display vertices with too many group assignments (orange)"
+    )
+    max_bone_groups: bpy.props.IntProperty(
+        name="Max Bone Groups",
+        default=4,
+        min=1,
+        max=16,
+        description="Maximum deform groups per vertex (default 4 for Unity)",
+        update=update_max_bone_groups
     )
     weight_overlay_data: bpy.props.CollectionProperty(type=EMESH_CoordItem)
+    vertex_group_overlay_data: bpy.props.CollectionProperty(type=EMESH_CoordItem)
 
 
 # ==================== OVERLAY DRAWING ====================
@@ -204,6 +256,32 @@ class EMESH_PT_MainPanel(bpy.types.Panel):
         layout.label(text="Modular Toolkit v2.5", icon="TOOL_SETTINGS")
 
 
+# ==================== SCENE HANDLERS ====================
+
+_last_active_object = None
+
+def scene_update_handler(scene):
+    """Monitor object selection changes for auto-shapekey selection"""
+    global _last_active_object
+    
+    context = bpy.context
+    if not context:
+        return
+    
+    obj = context.active_object
+    
+    # Check if active object changed
+    if obj != _last_active_object:
+        _last_active_object = obj
+        
+        # Trigger auto-shapekey selection if available
+        if obj and hasattr(bpy.ops.mesh, 'emesh_auto_select_shapekey'):
+            try:
+                bpy.ops.mesh.emesh_auto_select_shapekey()
+            except:
+                pass
+
+
 # ==================== REGISTRATION ====================
 
 classes = (
@@ -239,16 +317,36 @@ def register():
         draw_shapekey_overlay, (), "WINDOW", "POST_VIEW"
     )
     
+    # Register weight overlay from mod_weights
+    mod_weights._draw_handler = bpy.types.SpaceView3D.draw_handler_add(
+        mod_weights.draw_weight_overlay, (), "WINDOW", "POST_VIEW"
+    )
+    
+    # Register scene update handler for object selection monitoring
+    bpy.app.handlers.depsgraph_update_post.append(scene_update_handler)
+    
     print("Emil's Mesh Toolkit (Modular) registered successfully")
 
 
 def unregister():
     global _draw_handler
     
+    # Unregister scene update handler
+    if scene_update_handler in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.remove(scene_update_handler)
+    
     # Unregister shapekey overlay
     if _draw_handler:
         bpy.types.SpaceView3D.draw_handler_remove(_draw_handler, "WINDOW")
         _draw_handler = None
+    
+    # Unregister weight overlay
+    if hasattr(mod_weights, '_draw_handler') and mod_weights._draw_handler:
+        try:
+            bpy.types.SpaceView3D.draw_handler_remove(mod_weights._draw_handler, "WINDOW")
+        except:
+            pass
+        mod_weights._draw_handler = None
     
     # Unregister modules
     mod_selection.unregister()

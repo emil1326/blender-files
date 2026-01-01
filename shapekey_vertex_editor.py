@@ -443,7 +443,7 @@ class ShapekeyEditorProps(bpy.types.PropertyGroup):
     max_display_vertices: bpy.props.IntProperty(
         name="Max Display",
         description="Maximum vertices to show in overlay (largest movement first)",
-        default=2000,
+        default=5000,
         min=100,
         max=50000
     )
